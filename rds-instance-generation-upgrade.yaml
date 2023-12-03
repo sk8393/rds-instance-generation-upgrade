@@ -1,0 +1,553 @@
+AWSTemplateFormatVersion : '2010-09-09'
+
+Parameters:
+  ConfigRuleNameToDetectNonLatestGenerationRDSInstance:
+    Type: String
+    Default: 'rule-to-detect-non-latest-generation-rds-instance'
+    Description: 'Name of AWS Config Custom Lambda Rule to detect RDS DB instance with non-latest instance generation.'
+  TagKeyToUpgradeRDSInstanceGeneration:
+    Type: String
+    Default: 'upgrade-rds-instance-generation'
+    Description: 'Tag key that you set to RDS DB instance to upgrade to latest instance generation.'
+  TagValueToUpgradeRDSInstanceGeneration:
+    Type: String
+    Default: 'true'
+    Description: 'Tag value that you set to RDS DB instance to upgrade to latest instance generation.'
+  UpgradeInstanceGenerationDuringMaintenanceWindow:
+    Type: String
+    Default: 'true'
+    AllowedValues : ['true', 'false']
+    Description: 'Upgrade instance generation during maintenance window (true), or apply the change immediately (false).'
+
+Resources:
+  ResourceOfConfigRuleToDetectNonLatestGenerationRDSInstance:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ResourceOfLambdaPermission
+    Properties:
+      ConfigRuleName: !Ref ConfigRuleNameToDetectNonLatestGenerationRDSInstance
+      EvaluationModes:
+        - Mode: 'DETECTIVE'
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceDetails:
+        - EventSource: aws.config
+          MaximumExecutionFrequency: TwentyFour_Hours
+          MessageType: ScheduledNotification
+        SourceIdentifier: !GetAtt ResourceOfLambdaFunctionToDetectNonLatestGenerationRDSInstance.Arn
+
+  ResourceOfLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ResourceOfLambdaFunctionToDetectNonLatestGenerationRDSInstance.Arn
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+
+  ResourceOfIAMManagedPolicyToDeleteEvaluationResults:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "config:DeleteEvaluationResults"
+            Resource: "*"
+
+  ResourceOfIAMManagedPolicyToGetPricing:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "pricing:GetProducts"
+            Resource: "*"
+
+  ResourceOfIAMRoleToDetectNonLatestGenerationRDSInstance:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonRDSReadOnlyAccess
+        - arn:aws:iam::aws:policy/AWSLambda_FullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref ResourceOfIAMManagedPolicyToDeleteEvaluationResults
+        - !Ref ResourceOfIAMManagedPolicyToGetPricing
+
+  ResourceOfIAMRoleToUpgradeRDSInstanceGeneration:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonRDSFullAccess
+        - arn:aws:iam::aws:policy/AWSConfigUserAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  ResourceOfLambdaFunctionToDetectNonLatestGenerationRDSInstance:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import re
+          
+          CONFIG_RULE_NAME = os.environ['CONFIG_RULE_NAME']
+          SUBSEQUENT_FUNCTION = os.environ['SUBSEQUENT_FUNCTION']
+          TAG_KEY_TO_UPGRADE_RDS_INSTANCE_GENERATION = os.environ['TAG_KEY_TO_UPGRADE_RDS_INSTANCE_GENERATION']
+          TAG_VALUE_TO_UPGRADE_RDS_INSTANCE_GENERATION = os.environ['TAG_VALUE_TO_UPGRADE_RDS_INSTANCE_GENERATION']
+          
+          def get_price_list(_arg_filter_list):
+              price_list = list()
+              client = boto3.client('pricing', region_name='us-east-1')
+              paginator = client.get_paginator('get_products')
+              page_list = paginator.paginate(
+                  ServiceCode = 'AmazonRDS',
+                  Filters = _arg_filter_list
+              )
+              price_str_list = list()
+              for _i_page in page_list:
+                  price_str_list += _i_page.get('PriceList', [])
+              for _i_price_str in price_str_list:
+                  price_list.append(json.loads(_i_price_str))
+              return price_list
+          
+          def get_product_list():
+              region_code = os.environ['AWS_DEFAULT_REGION']
+              filter_list = [
+                  # {'Type':'TERM_MATCH','Field':'databaseEngine','Value': 'PostgreSQL'},
+                  {'Type':'TERM_MATCH','Field':'deploymentOption','Value': 'Single-AZ'},
+                  # {'Type':'TERM_MATCH','Field':'instanceType','Value': 'db.m6g.large'},
+                  {'Type':'TERM_MATCH','Field':'regionCode','Value': region_code},
+                  {'Type':'TERM_MATCH','Field':'termType','Value':'OnDemand'}
+              ]
+              price_list = get_price_list(filter_list)
+              return price_list
+          
+          def get_values_from_nested_dict(data, target_key):
+              result = []
+              if isinstance(data, dict):
+                  for key, value in data.items():
+                      if key == target_key:
+                          if isinstance(value, list):
+                              result.extend(value)
+                          else:
+                              result.append(value)
+                      elif isinstance(value, dict):
+                          result.extend(get_values_from_nested_dict(value, target_key))
+              return result
+          
+          def get_product_attributes(_arg_product):
+              product = _arg_product.get('product')
+              if product:
+                  pass
+              else:
+                  return None
+              attributes = product.get('attributes')
+              if attributes:
+                  pass
+              else:
+                  return None
+              instance_type = attributes.get('instanceType')
+              if instance_type:
+                  pass
+              else:
+                  return None
+              # Assuming instance_type_split is a list with 3 elements.
+              # e.g. 'instanceType' : 'db.m6id.24xlarge'
+              instance_type_split =  re.split("\.", instance_type)
+              # e.g. instance_type_without_size = 'm6id'
+              instance_type_without_size = instance_type_split[1]
+              # e.g. instance_size = '24xlarge'
+              instance_size = instance_type_split[2]
+              instance_generation_match = re.search(r'\d+', instance_type_without_size)
+              # e.g. instance_generation_match = 6
+              instance_generation = int(instance_generation_match.group())
+              instance_family_and_attribute = re.split('\d+', instance_type_without_size)
+              # e.g. instance_family = 'm'
+              instance_family = instance_family_and_attribute[0]
+              # e.g. instance_attribute = 'id'
+              instance_attribute = ''
+              if len(instance_family_and_attribute) == 2:
+                  instance_attribute = instance_family_and_attribute[1]
+              # e.g. database_engine = 'MySQL'
+              database_engine = attributes['databaseEngine']
+              # e.g. region_code = 'eu-central-1'
+              region_code = attributes['regionCode']
+              price_per_unit_dict_list = get_values_from_nested_dict(_arg_product['terms']['OnDemand'], 'pricePerUnit')
+              if len(price_per_unit_dict_list) != 1:
+                  # Pricing API result has to be filtered as only single per unit item is included there (Reserved Instances have multiple price items).
+                  print("multiple price per unit")
+                  exit()
+              # e.g. price_per_unit = 38.587
+              price_per_unit = float(price_per_unit_dict_list[0]['USD'])
+              r = {
+                  'database_engine': database_engine,
+                  'instance_attribute': instance_attribute,
+                  'instance_family': instance_family,
+                  'instance_generation': instance_generation,
+                  'instance_size': instance_size,
+                  'price_per_unit': price_per_unit,
+                  'region_code': region_code
+              }
+              return r
+          
+          def get_hashable_key(_arg_dict):
+              hashable_key = tuple(sorted(_arg_dict.items()))
+              return hashable_key
+          
+          def get_dict_to_obtain_best_instance_type(_arg_product_list):
+              tmp_dict_to_obtain_best_instance_type = {}
+              dict_to_obtain_best_instance_type = {}
+              for _i in _arg_product_list:
+                  product_attributes = get_product_attributes(_i)
+                  if product_attributes:
+                      pass
+                  else:
+                      continue
+                  unhashable_key = {
+                      'database_engine': product_attributes['database_engine'],
+                      'instance_family': product_attributes['instance_family'],
+                      'instance_size': product_attributes['instance_size'],
+                      'region_code': product_attributes['region_code']
+                  }
+                  hashable_key = get_hashable_key(unhashable_key)
+                  value = {
+                      'dummy_generation': 100-product_attributes['instance_generation'],
+                      'instance_attribute': product_attributes['instance_attribute'],
+                      'instance_generation': product_attributes['instance_generation'],
+                      'price_per_unit': product_attributes['price_per_unit']
+                  }
+                  if hashable_key in tmp_dict_to_obtain_best_instance_type:
+                      tmp_value = tmp_dict_to_obtain_best_instance_type[hashable_key]
+                      tmp_value.append(value)
+                      tmp_dict_to_obtain_best_instance_type[hashable_key] = tmp_value
+                  else:
+                      tmp_dict_to_obtain_best_instance_type[hashable_key] = [value]
+          
+              for _i_key, _j_value in tmp_dict_to_obtain_best_instance_type.items():
+                  sorted_value = sorted(_j_value, key=lambda x: (x['dummy_generation'], x['price_per_unit']), reverse=False)
+                  if _i_key in dict_to_obtain_best_instance_type:
+                      tmp_value = dict_to_obtain_best_instance_type[_i_key]
+                      tmp_value.append(sorted_value)
+                      dict_to_obtain_best_instance_type[_i_key] = tmp_value
+                  else:
+                      dict_to_obtain_best_instance_type[_i_key] = sorted_value
+              return dict_to_obtain_best_instance_type
+          
+          def get_db_instance_list():
+              db_instance_list = list()
+              region_code = os.environ['AWS_DEFAULT_REGION']
+              client = boto3.client('rds', region_name=region_code)
+              paginator = client.get_paginator('describe_db_instances')
+              page_list = paginator.paginate()
+              for _i_page in page_list:
+                  db_instance_list += _i_page.get('DBInstances', [])
+              return db_instance_list
+          
+          def get_formatted_db_instance_list(_arg_db_instance_list):
+              formatted_db_instance_list = list()
+              for _i in _arg_db_instance_list:
+                  try:
+                      formatted_db_instance = {}
+                      region_code = _i['AvailabilityZone'][:-1]
+                      db_instance_arn = _i['DBInstanceArn']
+                      db_instance_identifier = _i['DBInstanceIdentifier']
+                      database_engine = ''
+                      if _i['Engine'] == 'aurora-mysql':
+                          database_engine = 'Aurora MySQL'
+                      elif _i['Engine'] == 'aurora-postgresql':
+                          database_engine = 'Aurora PostgreSQL'
+                      elif _i['Engine'] == 'mariadb':
+                          database_engine = 'MariaDB'
+                      elif _i['Engine'] == 'mysql':
+                          database_engine = 'MySQL'
+                      # Not able to conduct test for Oracle, so exclude from this list.
+                      # elif _i['Engine'].startswith('oracle'):
+                      #     database_engine = 'Oracle'
+                      elif _i['Engine'] == 'postgres':
+                          database_engine = 'PostgreSQL'
+                      elif _i['Engine'].startswith('sqlserver'):
+                          database_engine = 'SQL Server'
+                      instance_type = _i['DBInstanceClass']
+                      instance_type_split =  re.split("\.", instance_type)
+                      instance_type_without_size = instance_type_split[1]
+                      instance_size = instance_type_split[2]
+                      instance_generation_match = re.search(r'\d+', instance_type_without_size)
+                      instance_generation = int(instance_generation_match.group())
+                      instance_family_and_attribute = re.split('\d+', instance_type_without_size)
+                      instance_family = instance_family_and_attribute[0]
+                      instance_attribute = ''
+                      if len(instance_family_and_attribute) == 2:
+                          instance_attribute = instance_family_and_attribute[1]
+                      d = {
+                          'database_engine': database_engine,
+                          'db_instance_arn': db_instance_arn,
+                          'db_instance_identifier': db_instance_identifier,
+                          'instance_attribute': instance_attribute,
+                          'instance_family': instance_family,
+                          'instance_generation': instance_generation,
+                          'instance_size': instance_size,
+                          'instance_type': instance_type,
+                          'region_code': region_code
+                      }
+                      formatted_db_instance_list.append(d)
+                  # For example, Aurora Serverless can have a value 'DBInstanceClass':'db.serverless' which does not fit to instance type extraction.
+                  # Other exceptional case can happen in the future, so just skipping those database instance to complete the process.
+                  except Exception as e:
+                      print("_i = {}".format(_i))
+                      print("e = {}".format(e))
+              return formatted_db_instance_list
+          
+          def delete_config_evaluation_result(_arg_config_rule_name):
+              client = boto3.setup_default_session(region_name=os.environ['AWS_DEFAULT_REGION'])
+              client = boto3.client('config')
+              response = client.delete_evaluation_results(
+                  ConfigRuleName=_arg_config_rule_name
+              )
+          
+          def put_config_evaluation(_arg_db_instance_list, _arg_db_instance_having_newer_instance_generation_list, _arg_result_token):
+              # db_instance_list = [d.get('db_instance_arn') for d in _arg_db_instance_list]
+              client = boto3.client("config")
+              evaluation_list = list()
+              for _i_db_instance in _arg_db_instance_list:
+                  db_instance_arn = _i_db_instance['db_instance_arn']
+                  evaluation = {
+                      'ComplianceResourceType': 'AWS::RDS::DBInstance',
+                      'ComplianceResourceId': db_instance_arn,
+                      'OrderingTimestamp': '1970-01-01T00:00:00.0Z'
+                  }
+                  db_instance_having_newer_instance_generation_list = [d.get('db_instance_arn') for d in _arg_db_instance_having_newer_instance_generation_list]
+                  if db_instance_arn in db_instance_having_newer_instance_generation_list:
+                      evaluation['ComplianceType'] = 'NON_COMPLIANT'
+                      annotation = "db.{}{}{}.{} is available, currently db.{}{}{}.{}. Set tag \'{}\':\'{}\' for auto upgrade.".format(
+                          _i_db_instance['instance_family'],
+                          _i_db_instance['best_instance_generation'],
+                          _i_db_instance['best_instance_attribute'],
+                          _i_db_instance['instance_size'],
+                          _i_db_instance['instance_family'],
+                          _i_db_instance['instance_generation'],
+                          _i_db_instance['instance_attribute'],
+                          _i_db_instance['instance_size'],
+                          TAG_KEY_TO_UPGRADE_RDS_INSTANCE_GENERATION,
+                          TAG_VALUE_TO_UPGRADE_RDS_INSTANCE_GENERATION
+                      )
+                      evaluation['Annotation'] = annotation
+                  else:
+                      evaluation['ComplianceType'] = 'COMPLIANT'
+                  evaluation_list.append(evaluation)
+              print("evaluation_list = {}".format(evaluation_list))
+              client.put_evaluations(
+                  Evaluations = evaluation_list,
+                  ResultToken = _arg_result_token
+              )
+          
+          def invoke_function():
+              p = {
+                  'dummy_key': 'dummy_value'
+              }
+              payload = json.dumps(p)
+              client = boto3.client('lambda', region_name=os.environ['AWS_DEFAULT_REGION'])
+              client.invoke(
+                  FunctionName = SUBSEQUENT_FUNCTION,
+                  InvocationType = 'Event',
+                  Payload = payload
+              )
+          
+          def lambda_handler(event, context):
+              print("event = {}".format(event))
+          
+              result_token = "No token found."
+              if "resultToken" in event:
+                  result_token = event["resultToken"]
+          
+              product_list = get_product_list()
+              # for _i_product in product_list:
+              #     print("_i_product = {}".format(_i_product))
+          
+              # Data looks like below.  First element in the value list has latest instance generation, and cheapest price.
+              # {
+              #   (('database_engine', 'PostgreSQL'), ('instance_family', 'm'), ('instance_size', 'xlarge'), ('region_code', 'eu-central-1')): [
+              #     {'dummy_generation': 93, 'instance_attribute': 'g', 'instance_generation': 7, 'price_per_unit': 0.401},
+              #     {'dummy_generation': 94, 'instance_attribute': 'g', 'instance_generation': 6, 'price_per_unit': 0.379},
+              #     {'dummy_generation': 94, 'instance_attribute': 'i', 'instance_generation': 6, 'price_per_unit': 0.424},
+              #     {'dummy_generation': 94, 'instance_attribute': 'gd', 'instance_generation': 6, 'price_per_unit': 0.448},
+              #     {'dummy_generation': 94, 'instance_attribute': 'id', 'instance_generation': 6, 'price_per_unit': 0.536},
+              #     {'dummy_generation': 95, 'instance_attribute': '', 'instance_generation': 5, 'price_per_unit': 0.424},
+              #     {'dummy_generation': 95, 'instance_attribute': 'd', 'instance_generation': 5, 'price_per_unit': 0.501},
+              #     {'dummy_generation': 96, 'instance_attribute': '', 'instance_generation': 4, 'price_per_unit': 0.435},
+              #     {'dummy_generation': 97, 'instance_attribute': '', 'instance_generation': 3, 'price_per_unit': 0.455}
+              #   ],
+              dict_to_obtain_best_instance_type = get_dict_to_obtain_best_instance_type(product_list)
+              # for _i_key, _j_value in dict_to_obtain_best_instance_type.items():
+              #     print("_i_key = {}".format(_i_key))
+              #     print("_j_value = {}".format(_j_value))
+          
+              db_instance_list = get_db_instance_list()
+              # for _i_db_instance in db_instance_list:
+              #     print("_i_db_instance = {}".format(_i_db_instance))
+              formatted_db_instance_list = get_formatted_db_instance_list(db_instance_list)
+              # for _i_formatted_db_instance in formatted_db_instance_list:
+              #     print("_i_formatted_db_instance = {}".format(_i_formatted_db_instance))
+          
+              formatted_db_instance_having_newer_instance_generation_list = list()
+              for _i_formatted_db_instance in formatted_db_instance_list:
+                  hashable_key = get_hashable_key({
+                      'database_engine': _i_formatted_db_instance['database_engine'],
+                      'instance_family': _i_formatted_db_instance['instance_family'],
+                      'instance_size': _i_formatted_db_instance['instance_size'],
+                      'region_code': _i_formatted_db_instance['region_code']
+                  })
+                  instance_type_option_list = dict_to_obtain_best_instance_type.get(hashable_key)
+                  if instance_type_option_list:
+                      pass
+                  else:
+                      continue
+                  best_instance_type_option = instance_type_option_list[0]
+                  _i_formatted_db_instance['best_instance_generation'] = best_instance_type_option['instance_generation']
+                  _i_formatted_db_instance['best_instance_attribute'] = best_instance_type_option['instance_attribute']
+                  if best_instance_type_option['instance_generation'] > _i_formatted_db_instance['instance_generation']:
+                      formatted_db_instance_having_newer_instance_generation_list.append(_i_formatted_db_instance)
+                  else:
+                      pass
+          
+              delete_config_evaluation_result(CONFIG_RULE_NAME)
+              put_config_evaluation(formatted_db_instance_list, formatted_db_instance_having_newer_instance_generation_list, result_token)
+          
+              invoke_function()
+      Environment:
+        Variables:
+          CONFIG_RULE_NAME: !Ref ConfigRuleNameToDetectNonLatestGenerationRDSInstance
+          SUBSEQUENT_FUNCTION: !Ref ResourceOfLambdaFunctionToUpgradeRDSInstanceGeneration
+          TAG_KEY_TO_UPGRADE_RDS_INSTANCE_GENERATION: !Ref TagKeyToUpgradeRDSInstanceGeneration
+          TAG_VALUE_TO_UPGRADE_RDS_INSTANCE_GENERATION: !Ref TagValueToUpgradeRDSInstanceGeneration
+      Handler: index.lambda_handler
+      Role: !GetAtt ResourceOfIAMRoleToDetectNonLatestGenerationRDSInstance.Arn
+      Runtime: python3.11
+      Timeout: 900
+
+  ResourceOfLambdaFunctionToUpgradeRDSInstanceGeneration:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore
+          import re
+          import os
+          import subprocess
+          
+          CONFIG_RULE_NAME = os.environ['CONFIG_RULE_NAME']
+          TAG_KEY_TO_UPGRADE_RDS_INSTANCE_GENERATION = os.environ['TAG_KEY_TO_UPGRADE_RDS_INSTANCE_GENERATION']
+          TAG_VALUE_TO_UPGRADE_RDS_INSTANCE_GENERATION = os.environ['TAG_VALUE_TO_UPGRADE_RDS_INSTANCE_GENERATION']
+          UPGRADE_INSTANCE_GENERATION_DURING_MAINTENANCE_WINDOW = os.environ['UPGRADE_INSTANCE_GENERATION_DURING_MAINTENANCE_WINDOW']
+          
+          def get_non_compliant_rds_instance_list():
+              evaluation_result_list = list()
+              client = boto3.client('config')
+              paginator = client.get_paginator('get_compliance_details_by_config_rule')
+              page_list = paginator.paginate(
+                  ComplianceTypes=['NON_COMPLIANT'],
+                  ConfigRuleName=CONFIG_RULE_NAME
+              )
+              count = 0
+              for _i_page in page_list:
+                  count += 1
+                  evaluation_result_list += _i_page.get('EvaluationResults', [])
+              resource_list = list()
+              for _i_evaluation_result in evaluation_result_list:
+                  print("_i_evaluation_result = {}".format(_i_evaluation_result))
+                  annotation = _i_evaluation_result['Annotation']
+                  print("annotation = {}".format(annotation))
+                  resource_id = _i_evaluation_result['EvaluationResultIdentifier']['EvaluationResultQualifier']['ResourceId']
+                  print("resource_id = {}".format(resource_id))
+                  resource_list.append({'annotation':annotation, 'resource_id':resource_id})
+              return resource_list
+          
+          def check_is_tag_set_to_upgrade_rds_instance_generation(_arg_db_instance_arn):
+              is_tag_set_to_upgrade_rds_instance_generation = False
+              client = boto3.client('rds')
+              try:
+                  response = client.list_tags_for_resource(ResourceName=_arg_db_instance_arn)
+                  print("response = {}".format(response))
+                  tag_set_list = response.get('TagList', [])
+                  for _i in tag_set_list:
+                      key = _i['Key']
+                      value = _i['Value']
+                      if key == TAG_KEY_TO_UPGRADE_RDS_INSTANCE_GENERATION and value == TAG_VALUE_TO_UPGRADE_RDS_INSTANCE_GENERATION:
+                          is_tag_set_to_upgrade_rds_instance_generation = True
+                      else:
+                          pass
+              except botocore.exceptions.ClientError as e:
+                  print("e = {}".format(e))
+              return is_tag_set_to_upgrade_rds_instance_generation
+          
+          def get_exception_messages(_arg_exception):
+              exception_message_list = list()
+              for _i_exception in _arg_exception.args:
+                  exception_message_list.append(str(_i_exception))
+              exception_messages = ','.join(exception_message_list)
+              return exception_messages
+          
+          def upgrade_rds_instance_generation(_arg_db_instance_arn, _arg_target_instance_generation):
+              print("_arg_db_instance_arn = {}".format(_arg_db_instance_arn))
+              print("_arg_target_instance_generation = {}".format(_arg_target_instance_generation))
+              db_instance_identifier = _arg_db_instance_arn.split(':')[-1]
+              print("db_instance_identifier = {}".format(db_instance_identifier))
+              client = boto3.client('rds')
+              try:
+                  apply_immediately = False
+                  if UPGRADE_INSTANCE_GENERATION_DURING_MAINTENANCE_WINDOW == 'false':
+                      apply_immediately = True
+                  client.modify_db_instance(
+                      ApplyImmediately=apply_immediately,
+                      DBInstanceClass=_arg_target_instance_generation,
+                      DBInstanceIdentifier=db_instance_identifier
+                  )
+              except botocore.exceptions.ClientError as e:
+                  print("e = {}".format(e))
+                  exception_messages = get_exception_messages(e)
+                  print("exception_messages = {}".format(exception_messages))
+          
+          def lambda_handler(event, context):
+              print("event = {}".format(event))
+              non_compliant_rds_instance_list = get_non_compliant_rds_instance_list()
+          
+              for _i in non_compliant_rds_instance_list:
+                  db_instance_arn = _i['resource_id']
+                  print("db_instance_arn = {}".format(db_instance_arn))
+                  target_instance_generation = _i['annotation'].split(' ')[0]
+                  print("target_instance_generation = {}".format(target_instance_generation))
+                  is_tag_set_to_upgrade_rds_instance_generation = check_is_tag_set_to_upgrade_rds_instance_generation(db_instance_arn)
+                  print("is_tag_set_to_upgrade_rds_instance_generation = {}".format(is_tag_set_to_upgrade_rds_instance_generation))
+                  if is_tag_set_to_upgrade_rds_instance_generation:
+                      upgrade_rds_instance_generation(db_instance_arn, target_instance_generation)
+      Environment:
+        Variables:
+          CONFIG_RULE_NAME: !Ref ConfigRuleNameToDetectNonLatestGenerationRDSInstance
+          TAG_KEY_TO_UPGRADE_RDS_INSTANCE_GENERATION: !Ref TagKeyToUpgradeRDSInstanceGeneration
+          TAG_VALUE_TO_UPGRADE_RDS_INSTANCE_GENERATION: !Ref TagValueToUpgradeRDSInstanceGeneration
+          UPGRADE_INSTANCE_GENERATION_DURING_MAINTENANCE_WINDOW: !Ref UpgradeInstanceGenerationDuringMaintenanceWindow
+      Handler: index.lambda_handler
+      Role: !GetAtt ResourceOfIAMRoleToUpgradeRDSInstanceGeneration.Arn
+      Runtime: python3.11
+      Timeout: 900
